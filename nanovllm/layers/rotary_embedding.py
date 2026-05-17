@@ -8,9 +8,12 @@ def apply_rotary_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
 ) -> torch.Tensor:
+    # 按最后一维把 x 切成两半
     x1, x2 = torch.chunk(x.float(), 2, dim=-1)
+    # 旋转
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
+    # 再拼回去
     return torch.cat((y1, y2), dim=-1).to(x.dtype)
 
 

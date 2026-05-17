@@ -74,16 +74,43 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
+        # 并行计算Q、K、V的线性层
+        # 每张卡负责一部分head的Q、K、V计算
         qkv = self.qkv_proj(hidden_states)
+
+        # 如果只有一张卡
+        # Q 大小为 [B, T, num_heads * head_dim]
+        # K 大小为 [B, T, num_kv_heads * head_dim]
+        # V 大小为 [B, T, num_kv_heads * head_dim]
+
+        # 如果有多张卡
+        # 每张卡的 Q 大小为 [B, T, num_heads * head_dim // tp_size]
+        # 每张卡的 K 大小为 [B, T, num_kv_heads * head_dim // tp_size]
+        # 每张卡的 V 大小为 [B, T, num_kv_heads * head_dim // tp_size]
+        # 切分的是输出维度 多张卡之间不需要通信 使用的是ColumnParallelLinear
+        # 即输入是完整的 hidden_states 每张卡都算完整输入对应的一部分输出 多张卡之间不需要通信
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q = q.view(-1, self.num_heads, self.head_dim)
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         v = v.view(-1, self.num_kv_heads, self.head_dim)
+
         if not self.qkv_bias:
             q = self.q_norm(q)
             k = self.k_norm(k)
+
+        # RoPE(Rotary Position Embedding) 注入位置信息
+        # 大小不变
         q, k = self.rotary_emb(positions, q, k)
+
+        # 每张卡计算attention输出的一部分
+        # 每张卡的输出大小为 [B, T, num_heads * head_dim // tp_size]
         o = self.attn(q, k, v)
+
+        # o_proj 用的是 RowParallelLinear
+        # 合并多张卡的attention输出
+        # 对于所有卡来说整体完成的是 [B, T, num_heads * head_dim] -> [B, T, hidden_size]
+        # 对于每张卡来说输入是 [B, T, num_heads * head_dim // tp_size] 输出是 [B, T, hidden_size // tp_size]
+        # 需要通信把每张卡的输出加起来得到完整的输出 (对应代码中的all_reduce)
         output = self.o_proj(o.flatten(1, -1))
         return output
 
@@ -111,8 +138,28 @@ class Qwen3MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
+        # x: [B, T, C]
+        # C就是hidden_size
+
+        # gate_up_proj 用的是 ColumnParallelLinear
+        # 对于所有卡来说是整体完成的是 [B, T, C] -> [B, T, 2 * intermediate_size]
+        # 而每张卡的输出是 [B, T, 2 * intermediate_size // tp_size]
+        # 多张卡之间不需要互相通信
         gate_up = self.gate_up_proj(x)
+
+        # 对于所有卡来说整体完成的是 [B, T, 2 * intermediate_size] -> [B, T, intermediate_size]
+        # 而每张卡的输出是 [B, T, intermediate_size // tp_size]
+        # act = silu(gate) * up 是逐元素的操作 多张卡之间不需要通信
         x = self.act_fn(gate_up)
+
+        # down_proj 用的是 RowParallelLinear
+        # 对于所有卡来说整体完成的是 [B, T, intermediate_size] -> [B, T, C]
+        # 对于每张卡来说输入是 [B, T, intermediate_size // tp_size] 输出是 [B, T, C // tp_size]
+        # 需要通信把每张卡的输出加起来得到完整的输出 即代码中的all_reduce(y)
+        # rank0: y0 = x0 @ w0^T + b0    大小为 [B, T, C // tp_size]
+        # rank1: y1 = x1 @ w1^T + b1    大小为 [B, T, C // tp_size]
+        # ...
+        # y = y0 + y1 + ...             大小为 [B, T, C]
         x = self.down_proj(x)
         return x
 
@@ -146,15 +193,33 @@ class Qwen3DecoderLayer(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        hidden_states: torch.Tensor,
+        hidden_states: torch.Tensor,        # hidden_states是输入x
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        本质上是为了了实现类似下面的计算 为了省中间变量 把residual来回传递
+        u = x + Attention(RMSNorm(x))
+        y = u + MLP(RMSNorm(u))
+        """
+
         if residual is None:
+            # residual = x
+            # hidden_states = RMSNorm(x)
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
+            # residual = residual + x
+            # hidden_states = RMSNorm(residual + x)
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        # hidden_states = Attention(RMSNorm(x))
         hidden_states = self.self_attn(positions, hidden_states)
+
+        # u = x + Attention(RMSNorm(x))
+        # hidden_states = RMSNorm(u)
+        # residual = u
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+
+        # hidden_states = MLP(RMSNorm(u))
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
@@ -175,6 +240,14 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> torch.Tensor:
+        """
+        整体模型的前向计算流程如下：
+        1. 首先通过词嵌入层将输入的 token 转换为 embedding
+        2. 经过多层 Qwen3DecoderLayer 每层中包含两个子层
+           * Attention子层 Qwen3Attention: x = x + Attention(RMSNorm(x))
+           * MLP子层 Qwen3MLP: x = x + MLP(RMSNorm(x))
+        3. 最后再进行一次 RMSNorm 得到最终输出
+        """
         hidden_states = self.embed_tokens(input_ids)
         residual = None
         for layer in self.layers:
