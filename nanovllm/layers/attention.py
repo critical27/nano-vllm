@@ -4,6 +4,7 @@ import triton
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+from nanovllm.engine.kv_cache import KVCacheLayer
 from nanovllm.utils.context import get_context
 
 
@@ -71,6 +72,10 @@ class Attention(nn.Module):
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
 
+    def bind_kv_cache(self, layer: KVCacheLayer):
+        self.k_cache = layer.k
+        self.v_cache = layer.v
+
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         # context中包含
         # is_prefill      当前是 prefill 还是 decode
@@ -99,6 +104,6 @@ class Attention(nn.Module):
         else:    # decode
             # decode直接使用KV Cache里的K/V来计算attention输出
             o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                        cache_seqlens=context.context_lens, block_table=context.block_tables,
                                         softmax_scale=self.scale, causal=True)
         return o

@@ -5,6 +5,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+from nanovllm.engine.kv_cache import KVCache
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
@@ -107,38 +108,14 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-
-        # doodle: 计算每张显卡上 KVCache中每个block需要多少字节（需要这么大空间 才能保存token的KV）
-        # Transformer中，Q有多少个头，K和V就也有多少个头，满足1对1的关系。
-        # 而目前很多模型的做法都采用GQA，即Q和K/V变成了多对一的关系，让多个Q头共享同一个K/V头，这样可以在不显著影响性能的前提下，减少KV缓存的显存占用。
-        # 2 * 层数 * 每个kvcache block能装多少 token * 每张卡上KV head数量 * 每个head负责的维度大小 * 数据类型字节数
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-
-        # 计算可用的kvcache中block数量（考虑显存利用率、已用、峰值、当前分配等）
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        # doodle: 计算每张显卡上 KVCache 可容纳多少个 block。
+        config.num_kvcache_blocks = KVCache.estimate_num_blocks(config, hf_config, self.world_size)
         assert config.num_kvcache_blocks > 0
 
-        # 分配KV缓存张量，形状为[2, 层数, block数量, block大小, kv head数量, head大小]
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
+        # 分配 KVCache 的内存
+        self.kv_cache = KVCache.from_model_config(config, hf_config, self.world_size)
         # 遍历模型的所有子模块，将分配好的KV缓存绑定到每一层
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]  # 绑定K缓存
-                module.v_cache = self.kv_cache[1, layer_id]  # 绑定V缓存
-                layer_id += 1
-
-    def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        return block_tables
+        self.kv_cache.bind_model(self.model)
 
     def prepare_prefill(self, seqs: list[Sequence]):
         """
@@ -162,7 +139,6 @@ class ModelRunner:
         cu_seqlens_k = [0]
         max_seqlen_q = 0
         max_seqlen_k = 0
-        slot_mapping = []
         block_tables = None
         for seq in seqs:
             start = seq.num_cached_tokens
@@ -175,36 +151,18 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:    # warmup
-                continue
-
-            # doodle: 一个block里有多个slot
-
-            # 第一个token在kvcache中的block序号
-            start_block = start // self.block_size
-            # 最后一个token在kvcache中的block序号（如果正好对齐block边界，则不占用新block）
-            end_block = (end + self.block_size - 1) // self.block_size
-            # 逐个 block 计算这个 block 里要写入的 slot 范围
-            for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
-                if i == start_block:
-                    slot_start += start % self.block_size
-                if i != end_block - 1:
-                    slot_end = seq.block_table[i] * self.block_size + self.block_size
-                else:
-                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
-                slot_mapping.extend(range(slot_start, slot_end))
 
         # 如果有 prefix cache（key 比 query 多），需要准备 block_tables
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+            block_tables = self.kv_cache.build_block_tables(seqs)
 
         # 转为 CUDA 张量并固定内存，提升推理效率
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        # 告诉模型每个新算的KV应该写到KV cache的哪个slot
+        slot_mapping = self.kv_cache.build_slot_mapping_for_prefill(seqs)
 
         # 设置推理上下文，包括 cu_seqlens、slot_mapping、block_tables 等
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
@@ -222,12 +180,11 @@ class ModelRunner:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = self.kv_cache.build_slot_mapping_for_decode(seqs)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        block_tables = self.kv_cache.build_block_tables(seqs)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
